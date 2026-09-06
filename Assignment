@@ -1,0 +1,539 @@
+"""
+=====================================================================
+ LIBRARY BOOK LENDING AND MANAGEMENT SYSTEM
+ CSA08 / Programming in Python - Assignment (CO1-CO3)
+ Author : D.MIDHUN SRI
+ Batch  : 2026
+ Faculty: DR.RAJASEKAR
+=====================================================================
+
+A single-file console application that demonstrates:
+  CO1 - Python fundamentals (variables, expressions, functions, modules)
+  CO2 - Control flow, string operations, functions
+  CO3 - Data structures: dictionaries, lists, tuples, sets
+
+Data Model
+----------
+members : dict   {member_id : {'name': str, 'category': str, 'location': tuple}}
+books   : dict   {book_id   : {'title': str, 'loan_fee': tuple, 'category': str}}
+loans   : dict   {member_id : [ {'book_id', 'status', 'issue_date',
+                                 'due_date', 'return_date'} , ... ] }
+categories : set of unique book categories in use
+
+Loan status values : 'Requested', 'Issued', 'Returned', 'Overdue', 'Lost'
+"""
+
+import csv
+import os
+import math
+from datetime import datetime, timedelta
+
+# ---------------------------------------------------------------------------
+# CUSTOM EXCEPTIONS  (at least one custom exception - required by assignment)
+# ---------------------------------------------------------------------------
+class LibraryError(Exception):
+    """Base class for all custom exceptions in this application."""
+    pass
+
+
+class InvalidMemberIDError(LibraryError):
+    """Raised when a Member ID does not exist in the members dictionary."""
+    pass
+
+
+class InvalidBookIDError(LibraryError):
+    """Raised when a Book ID does not exist in the books dictionary."""
+    pass
+
+
+class InvalidLoanStatusError(LibraryError):
+    """Raised when an invalid loan status is supplied."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# GLOBAL DATA STRUCTURES
+# ---------------------------------------------------------------------------
+members = {}        # dict  -> fast lookup by Member ID
+books = {}           # dict  -> fast lookup by Book ID
+loans = {}           # nested dict of lists -> {member_id: [loan_entry, ...]}
+categories = set()   # set   -> unique book categories
+
+VALID_STATUSES = ['Requested', 'Issued', 'Returned', 'Overdue', 'Lost']
+
+# Score used to compute the "Loan Value" (member reliability index).
+# 'Requested' loans are excluded (loan not yet active).
+STATUS_SCORE = {'Issued': 3, 'Returned': 4, 'Overdue': 1, 'Lost': 0}
+
+DATA_DIR = 'data'
+MEMBERS_CSV = os.path.join(DATA_DIR, 'members.csv')
+BOOKS_CSV = os.path.join(DATA_DIR, 'books.csv')
+LOANS_CSV = os.path.join(DATA_DIR, 'loans.csv')
+
+
+# ===========================================================================
+# 1. MEMBER MANAGEMENT MODULE
+# ===========================================================================
+def add_member(member_id, name, category, location):
+    """Add a new member. Uses string methods to normalise input (CO2)."""
+    member_id = member_id.strip().upper()
+    if member_id in members:
+        print(f"[!] Member ID '{member_id}' already exists.")
+        return False
+    members[member_id] = {
+        'name': name.strip().title(),
+        'category': category.strip().upper(),
+        'location': (location.strip().title(),)   # tuple - immutable data
+    }
+    categories.add(category.strip().upper())
+    loans.setdefault(member_id, [])
+    print(f"[OK] Member '{members[member_id]['name']}' added with ID {member_id}.")
+    return True
+
+
+def update_member(member_id, name=None, category=None, location=None):
+    member_id = member_id.strip().upper()
+    if member_id not in members:
+        raise InvalidMemberIDError(f"Member ID '{member_id}' not found.")
+    if name:
+        members[member_id]['name'] = name.strip().title()
+    if category:
+        members[member_id]['category'] = category.strip().upper()
+        categories.add(category.strip().upper())
+    if location:
+        members[member_id]['location'] = (location.strip().title(),)
+    print(f"[OK] Member {member_id} updated.")
+
+
+def delete_member(member_id):
+    member_id = member_id.strip().upper()
+    if member_id not in members:
+        raise InvalidMemberIDError(f"Member ID '{member_id}' not found.")
+    del members[member_id]
+    loans.pop(member_id, None)
+    print(f"[OK] Member {member_id} deleted.")
+
+
+def get_member(member_id):
+    member_id = member_id.strip().upper()
+    if member_id not in members:
+        raise InvalidMemberIDError(f"Member ID '{member_id}' not found.")
+    return members[member_id]
+
+
+# ===========================================================================
+# 2. BOOK MANAGEMENT MODULE
+# ===========================================================================
+def add_book(book_id, title, loan_fee, category):
+    book_id = book_id.strip().upper()
+    if book_id in books:
+        print(f"[!] Book ID '{book_id}' already exists.")
+        return False
+    books[book_id] = {
+        'title': title.strip().title(),
+        'loan_fee': (float(loan_fee),),   # tuple - immutable loan fee
+        'category': category.strip().upper()
+    }
+    categories.add(category.strip().upper())
+    print(f"[OK] Book '{books[book_id]['title']}' added with ID {book_id}.")
+    return True
+
+
+def update_book(book_id, title=None, loan_fee=None, category=None):
+    book_id = book_id.strip().upper()
+    if book_id not in books:
+        raise InvalidBookIDError(f"Book ID '{book_id}' not found.")
+    if title:
+        books[book_id]['title'] = title.strip().title()
+    if loan_fee is not None:
+        books[book_id]['loan_fee'] = (float(loan_fee),)
+    if category:
+        books[book_id]['category'] = category.strip().upper()
+        categories.add(category.strip().upper())
+    print(f"[OK] Book {book_id} updated.")
+
+
+def delete_book(book_id):
+    book_id = book_id.strip().upper()
+    if book_id not in books:
+        raise InvalidBookIDError(f"Book ID '{book_id}' not found.")
+    del books[book_id]
+    print(f"[OK] Book {book_id} deleted.")
+
+
+def get_book(book_id):
+    book_id = book_id.strip().upper()
+    if book_id not in books:
+        raise InvalidBookIDError(f"Book ID '{book_id}' not found.")
+    return books[book_id]
+
+
+# ===========================================================================
+# 3. LENDING MANAGEMENT MODULE
+# ===========================================================================
+def assign_loan(member_id, book_id, status='Issued', days=14):
+    member_id = member_id.strip().upper()
+    book_id = book_id.strip().upper()
+
+    if member_id not in members:
+        raise InvalidMemberIDError(f"Member ID '{member_id}' not found.")
+    if book_id not in books:
+        raise InvalidBookIDError(f"Book ID '{book_id}' not found.")
+    if status not in VALID_STATUSES:
+        raise InvalidLoanStatusError(
+            f"'{status}' is invalid. Must be one of {VALID_STATUSES}.")
+
+    issue_date = datetime.now().date()
+    due_date = issue_date + timedelta(days=days)
+    loan_entry = {
+        'book_id': book_id,
+        'status': status,
+        'issue_date': str(issue_date),
+        'due_date': str(due_date),
+        'return_date': ''
+    }
+    loans.setdefault(member_id, []).append(loan_entry)
+    print(f"[OK] Loan assigned: Member {member_id} <- Book {book_id} ({status}).")
+    return loan_entry
+
+
+def update_loan_status(member_id, book_id, new_status):
+    member_id = member_id.strip().upper()
+    book_id = book_id.strip().upper()
+    if new_status not in VALID_STATUSES:
+        raise InvalidLoanStatusError(
+            f"'{new_status}' is invalid. Must be one of {VALID_STATUSES}.")
+    if member_id not in loans:
+        raise InvalidMemberIDError(f"No loans found for member '{member_id}'.")
+
+    for entry in loans[member_id]:
+        if entry['book_id'] == book_id and entry['status'] != 'Returned':
+            entry['status'] = new_status
+            if new_status == 'Returned':
+                entry['return_date'] = str(datetime.now().date())
+            print(f"[OK] Loan status for {member_id}/{book_id} -> {new_status}.")
+            return True
+    print(f"[!] Active loan for {member_id}/{book_id} not found.")
+    return False
+
+
+# ===========================================================================
+# 4. SEARCH & RETRIEVAL MODULE
+# ===========================================================================
+def search_members_by_name(name):
+    """Linear search using string containment (CO2 illustrative program)."""
+    name = name.strip().lower()
+    return [mid for mid, d in members.items() if name in d['name'].lower()]
+
+
+def search_members_by_category(category):
+    category = category.strip().upper()
+    return [mid for mid, d in members.items() if d['category'] == category]
+
+
+def search_members_by_location(location):
+    location = location.strip().title()
+    return [mid for mid, d in members.items() if d['location'][0] == location]
+
+
+def search_books_by_category(category):
+    category = category.strip().upper()
+    return [bid for bid, d in books.items() if d['category'] == category]
+
+
+def get_loans_for_member(member_id):
+    member_id = member_id.strip().upper()
+    if member_id not in members:
+        raise InvalidMemberIDError(f"Member ID '{member_id}' not found.")
+    return loans.get(member_id, [])
+
+
+# ===========================================================================
+# 5. LENDING ANALYSIS MODULE
+# ===========================================================================
+def calculate_loan_value(member_id):
+    """
+    Loan Value = weighted-average reliability score of a member's loans,
+    weighted by each book's loan fee. Range 0.0 (worst) - 4.0 (best).
+    Requested (not yet active) loans are excluded from the calculation.
+    """
+    member_id = member_id.strip().upper()
+    if member_id not in members:
+        raise InvalidMemberIDError(f"Member ID '{member_id}' not found.")
+
+    member_loans = loans.get(member_id, [])
+    total_weighted, total_fee = 0.0, 0.0
+
+    for entry in member_loans:
+        status = entry['status']
+        if status not in STATUS_SCORE:      # skip 'Requested'
+            continue
+        book = books.get(entry['book_id'])
+        if not book:
+            continue
+        fee = book['loan_fee'][0]
+        total_weighted += STATUS_SCORE[status] * fee
+        total_fee += fee
+
+    if total_fee == 0:
+        return 0.0
+    return round(total_weighted / total_fee, 2)
+
+
+def find_top_member_for_book(book_id):
+    """Member with the best status (highest score) for a specific book."""
+    book_id = book_id.strip().upper()
+    if book_id not in books:
+        raise InvalidBookIDError(f"Book ID '{book_id}' not found.")
+
+    best_member, best_score = None, -1
+    for mid, entries in loans.items():
+        for e in entries:
+            if e['book_id'] == book_id and e['status'] in STATUS_SCORE:
+                if STATUS_SCORE[e['status']] > best_score:
+                    best_score = STATUS_SCORE[e['status']]
+                    best_member = mid
+    return best_member, best_score
+
+
+def find_at_risk_members(threshold=2.0):
+    """Members whose Loan Value is below the given threshold."""
+    return [mid for mid in members if calculate_loan_value(mid) < threshold]
+
+
+def average_status_for_book(book_id):
+    """Average reliability score across all loans of a specific book."""
+    book_id = book_id.strip().upper()
+    if book_id not in books:
+        raise InvalidBookIDError(f"Book ID '{book_id}' not found.")
+
+    scores = [STATUS_SCORE[e['status']]
+              for entries in loans.values() for e in entries
+              if e['book_id'] == book_id and e['status'] in STATUS_SCORE]
+    return round(sum(scores) / len(scores), 2) if scores else None
+
+
+def books_with_highest_overdue():
+    """Returns list of (book_id, overdue_rate%) sorted descending."""
+    total = {}
+    overdue = {}
+    for entries in loans.values():
+        for e in entries:
+            bid = e['book_id']
+            total[bid] = total.get(bid, 0) + 1
+            if e['status'] in ('Overdue', 'Lost'):
+                overdue[bid] = overdue.get(bid, 0) + 1
+
+    rates = [(bid, round(overdue.get(bid, 0) / count * 100, 1))
+             for bid, count in total.items()]
+    rates.sort(key=lambda x: x[1], reverse=True)
+    return rates
+
+
+def category_average_loan_value():
+    """Average Loan Value grouped by member category (dict comprehension)."""
+    grouped = {}
+    for mid, d in members.items():
+        grouped.setdefault(d['category'], []).append(calculate_loan_value(mid))
+    return {cat: round(sum(vals) / len(vals), 2) for cat, vals in grouped.items() if vals}
+
+
+# ===========================================================================
+# 6. REPORT GENERATION MODULE
+# ===========================================================================
+def member_loan_summary_report(member_id):
+    member_id = member_id.strip().upper()
+    m = get_member(member_id)
+    lv = calculate_loan_value(member_id)
+    lines = [
+        "=" * 50,
+        f"MEMBER LOAN SUMMARY - {member_id}",
+        "=" * 50,
+        f"Name      : {m['name']}",
+        f"Category  : {m['category']}",
+        f"Location  : {m['location'][0]}",
+        f"Loan Value: {lv}",
+        "-" * 50,
+        f"{'Book ID':<10}{'Status':<12}{'Issue Date':<12}{'Due Date':<12}"
+    ]
+    for e in loans.get(member_id, []):
+        lines.append(f"{e['book_id']:<10}{e['status']:<12}{e['issue_date']:<12}{e['due_date']:<12}")
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
+def category_performance_report():
+    lines = ["=" * 40, "BOOK CATEGORY PERFORMANCE REPORT", "=" * 40]
+    for cat, avg in category_average_loan_value().items():
+        lines.append(f"{cat:<15}: Avg Loan Value = {avg}")
+    lines.append("=" * 40)
+    return "\n".join(lines)
+
+
+def book_performance_report():
+    lines = ["=" * 50, "BOOK PERFORMANCE REPORT (Status Distribution)", "=" * 50]
+    for bid, book in books.items():
+        dist = {s: 0 for s in VALID_STATUSES}
+        for entries in loans.values():
+            for e in entries:
+                if e['book_id'] == bid:
+                    dist[e['status']] += 1
+        dist_str = ", ".join(f"{k}:{v}" for k, v in dist.items())
+        lines.append(f"{bid} - {book['title']:<20} [{dist_str}]")
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# 7. DATA PERSISTENCE MODULE (CSV)
+# ===========================================================================
+def save_data_to_csv():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        with open(MEMBERS_CSV, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['member_id', 'name', 'category', 'location'])
+            for mid, d in members.items():
+                writer.writerow([mid, d['name'], d['category'], d['location'][0]])
+
+        with open(BOOKS_CSV, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['book_id', 'title', 'loan_fee', 'category'])
+            for bid, d in books.items():
+                writer.writerow([bid, d['title'], d['loan_fee'][0], d['category']])
+
+        with open(LOANS_CSV, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['member_id', 'book_id', 'status', 'issue_date', 'due_date', 'return_date'])
+            for mid, entries in loans.items():
+                for e in entries:
+                    writer.writerow([mid, e['book_id'], e['status'],
+                                      e['issue_date'], e['due_date'], e['return_date']])
+        print("[OK] All data saved to CSV files in ./data/")
+    except (IOError, OSError) as err:
+        print(f"[ERROR] Could not save data: {err}")
+    finally:
+        print("[INFO] Save operation finished.")
+
+
+def load_data_from_csv():
+    try:
+        with open(MEMBERS_CSV, newline='') as f:
+            for row in csv.DictReader(f):
+                members[row['member_id']] = {
+                    'name': row['name'], 'category': row['category'],
+                    'location': (row['location'],)
+                }
+                categories.add(row['category'])
+
+        with open(BOOKS_CSV, newline='') as f:
+            for row in csv.DictReader(f):
+                books[row['book_id']] = {
+                    'title': row['title'], 'loan_fee': (float(row['loan_fee']),),
+                    'category': row['category']
+                }
+                categories.add(row['category'])
+
+        with open(LOANS_CSV, newline='') as f:
+            for row in csv.DictReader(f):
+                loans.setdefault(row['member_id'], []).append({
+                    'book_id': row['book_id'], 'status': row['status'],
+                    'issue_date': row['issue_date'], 'due_date': row['due_date'],
+                    'return_date': row['return_date']
+                })
+        print("[OK] Data loaded from ./data/ CSV files.")
+    except FileNotFoundError:
+        print("[INFO] No existing data files found - starting with an empty system.")
+    except Exception as err:
+        print(f"[ERROR] Unexpected error while loading data: {err}")
+    finally:
+        print("[INFO] Load operation finished.")
+
+
+# ===========================================================================
+# 8. DEMO / ILLUSTRATIVE PROGRAMS (CO1 basic illustrative programs)
+# ===========================================================================
+def demo_swap_variables():
+    a, b = 5, 9
+    print(f"Before swap: a={a}, b={b}")
+    a, b = b, a
+    print(f"After swap : a={a}, b={b}")
+
+
+def demo_distance_between_points():
+    x1, y1 = 0, 0
+    x2, y2 = 3, 4
+    distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+    print(f"Distance between ({x1},{y1}) and ({x2},{y2}) = {distance}")
+
+
+def demo_gcd():
+    def gcd(a, b):
+        while b:
+            a, b = b, a % b
+        return a
+    x, y = 48, 18
+    print(f"GCD of {x} and {y} = {gcd(x, y)}")
+
+
+def load_sample_data():
+    """Populates the system with sample data for quick testing/demo."""
+    add_member('M001', 'Arun Kumar', 'CS', 'Chennai')
+    add_member('M002', 'Divya Shree', 'IT', 'Coimbatore')
+    add_member('M003', 'Karthik Raja', 'ECE', 'Madurai')
+
+    add_book('B001', 'python programming', 4, 'CS')
+    add_book('B002', 'data structures', 3, 'CS')
+    add_book('B003', 'digital electronics', 2, 'ECE')
+    add_book('B004', 'database systems', 4, 'IT')
+
+    assign_loan('M001', 'B001', 'Returned')
+    assign_loan('M001', 'B002', 'Issued')
+    assign_loan('M002', 'B004', 'Overdue')
+    assign_loan('M003', 'B003', 'Lost')
+    print("[OK] Sample data loaded.")
+
+
+# ===========================================================================
+# 9. MAIN MENU / PROGRAM FLOW
+# ===========================================================================
+def print_menu():
+    print("\n" + "=" * 55)
+    print(" LIBRARY BOOK LENDING AND MANAGEMENT SYSTEM")
+    print("=" * 55)
+    print(" 1. Member Management")
+    print(" 2. Book Management")
+    print(" 3. Lending Management")
+    print(" 4. Search & Retrieval")
+    print(" 5. Lending Analysis")
+    print(" 6. Reports")
+    print(" 7. Save / Load Data (CSV)")
+    print(" 8. Demo Programs (CO1 illustrative)")
+    print(" 9. Load Sample Data (for testing)")
+    print(" 0. Exit")
+    print("=" * 55)
+
+
+def member_menu():
+    print("\n-- Member Management --")
+    print("1.Add 2.Update 3.Delete 4.View All")
+    ch = input("Choice: ").strip()
+    try:
+        if ch == '1':
+            mid = input("Member ID: ")
+            name = input("Name: ")
+            cat = input("Category: ")
+            loc = input("Location: ")
+            add_member(mid, name, cat, loc)
+        elif ch == '2':
+            mid = input("Member ID: ")
+            name = input("New Name (blank=skip): ") or None
+            update_member(mid, name=name)
+        elif ch == '3':
+            mid = input("Member ID: ")
+            delete_member(mid)
+        elif ch == '4':
+            for mid, d in members.items():
+                print(mid, d)
+   
